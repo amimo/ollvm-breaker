@@ -563,19 +563,21 @@ def fix_link(bv: BinaryView, pw: PatchWriter, link: CFGLink):
         # mov     w20, w0
         # b       to_dispatcher
         #
-        # cset    w7, eq
+        # csel    w7, w15, w14
         # mov     w20, w0
         # b       patch_code
         #
         # patch_code:
-        # cbnz    w7, true_branch (0x8)
-        # cbz     w7, false_branch
+        # b.eq    w7, true_branch (0x8)
+        # b       w7, false_branch
         # true_branch:
+        # original instruction after csel to patched terminator
         # original instruction at patch point
         # collected instructions from this block to dispatcher
         # collected instructions from dispatcher to true target
         # b true_target
         # false_branch:
+        # original instruction after csel to patched terminator
         # original instruction at patch point
         # collected instructions from this block to dispatcher
         # collected instructions from dispatcher to false target
@@ -586,13 +588,48 @@ def fix_link(bv: BinaryView, pw: PatchWriter, link: CFGLink):
         inst = AsmInst(bv.get_disassembly(def_il.address))
         assert inst.is_csel()
 
-        enter_codes = link.gather_enter_dispatcher_insns(bv, pw.current_pos())
+        assert link.block.outgoing_edges[0].type == BranchType.UnconditionalBranch
+
+        # copy all instructions from csel instruction to terminator
+        # some of them may change the condition flags, so copy them on both path
+        enter_codes = b''
+        if terminater.address == def_il.address:
+            # 0    : csel xx
+            # 1    : next_inst -> fullthrough to dispatcher
+            # copy [0, 1]
+            print('fullthrough case 0 0x%x' % terminater.address)
+            enter_codes += bv.read(terminater.address, ARM64_INSTRUCTION_LENGTH)
+        else:
+            def_il_next_address = def_il.address + ARM64_INSTRUCTION_LENGTH
+            if terminater.address != def_il_next_address:
+                if link.block.outgoing_edges[0].fall_through:  # need to copy the last instruction in the block
+                    #  0    : csel xx
+                    #  1    : next_inst
+                    #  .    :   ....
+                    #  n    : fullthrough to dispatcher
+                    #  copy [0, n]
+                    copy_size = terminater.address - def_il_next_address + ARM64_INSTRUCTION_LENGTH
+                    print('fullthrough case 1 0x%x' % (terminater.address))
+                else:
+                    # 0    : csel xx
+                    # 1    : next_inst
+                    # .    : ....
+                    # n - 1: xxx
+                    # n    : b to_dispatcher -> branch to dispatcher
+                    # copy [0, n - 1]
+                    copy_size = terminater.address - def_il_next_address
+                    print('branch to dispatcher 0x%x' % terminater.address)
+                enter_codes += bv.read(def_il_next_address, copy_size)
+                # fill nop
+                pw.write_at_addr(def_il_next_address, b'\x1f\x20\x03\xd5' * (copy_size // ARM64_INSTRUCTION_LENGTH))
+
+        enter_codes += link.gather_enter_dispatcher_insns(bv, pw.current_pos())
         true_branch_codes = link.gather_leave_dispatcher_insns(bv, pw.current_pos(), 0)
         false_branch_codes = link.gather_leave_dispatcher_insns(bv, pw.current_pos(), 1)
 
-        patch_codes = safe_asm(bv, "cbnz %s, 0x8" % (inst.operands[0]))
+        patch_codes = safe_asm(bv, "b.%s 0x8" % inst.operands[-1])
         pw.write(patch_codes)
-        patch_codes = safe_asm(bv, "cbz %s, %d" % (inst.operands[0], 8 + len(true_branch_codes) + len(enter_codes)))
+        patch_codes = safe_asm(bv, "b 0x%x" % (8 + len(true_branch_codes) + len(enter_codes)))
         pw.write(patch_codes)
 
         pw.write(enter_codes)
@@ -605,10 +642,6 @@ def fix_link(bv: BinaryView, pw: PatchWriter, link: CFGLink):
         patch_codes = safe_asm(bv, "b %s" % (rel(link.targets[1].source_block.start, pw.current_pos())))
         pw.write(patch_codes)
         print('patch branch address 0x%x' % terminater.address)
-
-        # patch terminator to jump to patch code
-        patch_codes = safe_asm(bv, "cset %s, %s" % (inst.operands[0], inst.operands[-1]))
-        pw.write_at_addr(def_il.address, patch_codes)
 
         patch_codes = safe_asm(bv, "b %s" % (rel(patch_code_addr, terminater.address)))
         pw.write_at_addr(terminater.address, patch_codes)
